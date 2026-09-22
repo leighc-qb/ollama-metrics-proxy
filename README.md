@@ -1,3 +1,17 @@
+> ### Fork notice
+>
+> Fork of [`elliotfehr/ollama-metrics-proxy`](https://github.com/elliotfehr/ollama-metrics-proxy).
+>
+> It adds a **null-content filter** that repairs the malformed
+> `{"role":"assistant","content":null}` messages GitHub Copilot sends, which Ollama
+> otherwise rejects with `400 invalid message content type: <nil>`, plus a small
+> upstream-URL fix. All Prometheus metrics behave exactly as upstream.
+>
+> See [Null-content filter (fork addition)](#null-content-filter-fork-addition).
+>
+> `main` tracks upstream exactly; changes live on the
+> [`null-content-filter-fix`](https://github.com/leighc-qb/ollama-metrics-proxy/tree/null-content-filter-fix) branch.
+
 # ollama-metrics-proxy
 
 A lightweight reverse proxy that sits in front of [Ollama](https://ollama.com) and exposes Prometheus metrics for inference requests. It transparently captures token counts, request durations, and generation speed without requiring any changes to your Ollama setup or client applications.
@@ -111,3 +125,135 @@ All other endpoints (`/api/tags`, `/api/show`, `/api/ps`, health checks, etc.) a
 ## License
 
 [MIT](LICENSE)
+
+
+---
+
+## Null-content filter (fork addition)
+
+*Documents functionality that exists only in this fork.*
+
+### The problem
+
+GitHub Copilot (CLI and desktop app) sometimes emits an assistant message whose
+`content` is JSON `null` and which carries **no** `tool_calls`:
+
+```json
+{"role": "assistant", "content": null}
+```
+
+The OpenAI API tolerates this. Ollama does not:
+
+```
+400 invalid message content type: <nil>
+```
+
+Because the bad message stays in the conversation history it is replayed on every
+later turn, so a session fails permanently once one appears.
+
+Upstream bug reports:
+
+- GitHub Copilot CLI — <https://github.com/github/copilot-cli/issues/4269>
+- GitHub Copilot app — <https://github.com/github/app/issues/2140>
+
+### The fix
+
+`repairEmptyAssistantMessages()` in [`proxy.go`](proxy.go) rewrites `content: null`
+to `content: ""` before the request reaches Ollama.
+
+It runs only when **all** of these hold:
+
+- the method is `POST`
+- the `Content-Type` is JSON (absent, `application/json`, or `*+json`)
+- the endpoint is `/v1/chat/completions` or `/api/chat`
+
+### Repair predicate
+
+Within such a request, a message is rewritten **only** when:
+
+| Condition | Required value |
+|---|---|
+| `role` | exactly `"assistant"` |
+| `content` | key **present** and JSON `null` |
+| `tool_calls` | absent, `null`, or `[]` |
+| `function_call` | absent or `null` |
+
+An assistant message with **real** `tool_calls` is a *legitimate* use of
+`content: null` and is never rewritten -- doing so would break tool calling.
+
+### Why it operates on `json.RawMessage`
+
+The filter decodes into `map[string]json.RawMessage`, not `map[string]any`, and
+rewrites only the `content` value of the offending messages. Every other field keeps
+its **exact original bytes**.
+
+This matters. A naive `map[string]any` implementation round-trips every JSON number
+through `float64` and silently corrupts large integers:
+
+```
+seed 9007199254740993  ->  9007199254740992     # off by one, beyond 2^53
+seed 12345678901234567890 -> 12345678901234567000
+```
+
+Options like `seed` and `num_ctx` are passed straight through to Ollama, so that
+corruption would be a real, hard-to-diagnose bug. It is locked out by
+`TestRepairPreservesLargeNumbersExactly` in
+[`nullcontent_regression_test.go`](nullcontent_regression_test.go).
+
+When no message needs repair the body is forwarded **byte-for-byte unchanged**, so
+the filter is a no-op for every non-Copilot client.
+
+### Example
+
+Before (rejected by Ollama):
+
+```json
+{"messages": [
+  {"role": "user", "content": "hi"},
+  {"role": "assistant", "content": null}
+]}
+```
+
+After (accepted):
+
+```json
+{"messages": [
+  {"role": "user", "content": "hi"},
+  {"role": "assistant", "content": ""}
+]}
+```
+
+Left alone -- this one has real `tool_calls`:
+
+```json
+{"role": "assistant", "content": null,
+ "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ls"}}]}
+```
+
+### Observability
+
+Each repaired request logs one line:
+
+```
+copilot_null_content_repaired path=/v1/chat/completions count=1
+```
+
+`count` is the number of messages repaired. Nothing is logged when nothing needed
+repair.
+
+### Upstream URL handling
+
+Also fixed here: the proxy now preserves the query string and any base path when
+building the upstream request, instead of concatenating the endpoint onto the
+configured URL.
+
+### Tests
+
+```sh
+go test -run Repair -v ./...
+```
+
+- [`proxy_test.go`](proxy_test.go) -- predicate table, endpoint coverage, and the
+  non-JSON content-type skip
+- [`nullcontent_regression_test.go`](nullcontent_regression_test.go) -- numeric
+  precision, unrelated-field preservation, and byte-identical no-op behaviour

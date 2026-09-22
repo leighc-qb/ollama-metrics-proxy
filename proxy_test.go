@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -363,6 +364,186 @@ func TestInjectStreamUsageInvalidJSON(t *testing.T) {
 	result := injectStreamUsage([]byte(input))
 	if string(result) != input {
 		t.Errorf("expected input returned unchanged, got %s", result)
+	}
+}
+
+func TestRepairEmptyAssistantMessages(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		want      string
+		count     int
+		unchanged bool
+	}{
+		{
+			name:  "assistant null content",
+			input: `{"messages":[{"role":"assistant","content":null}]}`,
+			want:  `{"messages":[{"role":"assistant","content":""}]}`,
+			count: 1,
+		},
+		{
+			name:  "empty tool calls",
+			input: `{"messages":[{"role":"assistant","content":null,"tool_calls":[]}]}`,
+			want:  `{"messages":[{"role":"assistant","content":"","tool_calls":[]}]}`,
+			count: 1,
+		},
+		{
+			name:  "null tool calls",
+			input: `{"messages":[{"role":"assistant","content":null,"tool_calls":null}]}`,
+			want:  `{"messages":[{"role":"assistant","content":"","tool_calls":null}]}`,
+			count: 1,
+		},
+		{
+			name:      "non-empty tool calls",
+			input:     `{"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1"}]}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "legacy function call",
+			input:     `{"messages":[{"role":"assistant","content":null,"function_call":{"name":"x","arguments":"{}"}}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "empty string content",
+			input:     `{"messages":[{"role":"assistant","content":""}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "normal string content",
+			input:     `{"messages":[{"role":"assistant","content":"normal text"}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "content absent",
+			input:     `{"messages":[{"role":"assistant"}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "non-assistant null content",
+			input:     `{"messages":[{"role":"user","content":null},{"role":"system","content":null},{"role":"tool","content":null}]}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:  "multiple invalid assistant messages",
+			input: `{"messages":[{"role":"assistant","content":null},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1"}]},{"role":"assistant","content":null,"function_call":null},{"role":"user","content":null}]}`,
+			want:  `{"messages":[{"role":"assistant","content":""},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1"}]},{"role":"assistant","content":"","function_call":null},{"role":"user","content":null}]}`,
+			count: 2,
+		},
+		{
+			name:      "messages not a list",
+			input:     `{"messages":{}}`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "non-object body",
+			input:     `[]`,
+			count:     0,
+			unchanged: true,
+		},
+		{
+			name:      "nested tool argument content",
+			input:     `{"messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"arguments":"{\"content\":null}"}}]}]}`,
+			count:     0,
+			unchanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, count := repairEmptyAssistantMessages([]byte(tt.input))
+			if count != tt.count {
+				t.Fatalf("repair count = %d, want %d", count, tt.count)
+			}
+			if tt.unchanged {
+				if string(got) != tt.input {
+					t.Fatalf("body changed unexpectedly: %s", got)
+				}
+				return
+			}
+
+			var gotValue, wantValue any
+			if err := json.Unmarshal(got, &gotValue); err != nil {
+				t.Fatalf("repaired body is invalid JSON: %v", err)
+			}
+			if err := json.Unmarshal([]byte(tt.want), &wantValue); err != nil {
+				t.Fatalf("test expectation is invalid JSON: %v", err)
+			}
+			if !reflect.DeepEqual(gotValue, wantValue) {
+				t.Errorf("repaired body = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRepairAppliedToSupportedInferenceEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"/v1/chat/completions", "/api/chat"} {
+		t.Run(endpoint, func(t *testing.T) {
+			var forwarded []byte
+			var query string
+			backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				forwarded, _ = io.ReadAll(r.Body)
+				query = r.URL.RawQuery
+				json.NewEncoder(w).Encode(ollamaStats{Model: "llama3", Done: true})
+			})
+
+			p, _ := testProxy(t, backend)
+			req := httptest.NewRequest(
+				http.MethodPost,
+				endpoint+"?request_id=metadata-only",
+				strings.NewReader(`{"model":"llama3","stream":false,"messages":[{"role":"assistant","content":null}]}`),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			p.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rr.Code)
+			}
+			if query != "request_id=metadata-only" {
+				t.Fatalf("upstream query = %q, want request_id=metadata-only", query)
+			}
+
+			var body struct {
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(forwarded, &body); err != nil {
+				t.Fatalf("upstream body is invalid JSON: %v", err)
+			}
+			if len(body.Messages) != 1 || body.Messages[0].Content != "" {
+				t.Fatalf("upstream body did not repair content: %s", forwarded)
+			}
+		})
+	}
+}
+
+func TestRepairSkipsNonJSONContentType(t *testing.T) {
+	var forwarded []byte
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded, _ = io.ReadAll(r.Body)
+		json.NewEncoder(w).Encode(ollamaStats{Model: "llama3", Done: true})
+	})
+
+	p, _ := testProxy(t, backend)
+	input := `{"model":"llama3","stream":false,"messages":[{"role":"assistant","content":null}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(input))
+	req.Header.Set("Content-Type", "text/plain")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if string(forwarded) != input {
+		t.Fatalf("non-JSON request changed: %s", forwarded)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -169,6 +171,15 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 		model = "unknown"
 	}
 
+	if r.Method == http.MethodPost && isJSONContentType(r) &&
+		(endpoint == "/api/chat" || endpoint == "/v1/chat/completions") {
+		var repaired int
+		body, repaired = repairEmptyAssistantMessages(body)
+		if repaired > 0 {
+			log.Printf("copilot_null_content_repaired path=%s count=%d", endpoint, repaired)
+		}
+	}
+
 	streaming := resolveStreaming(endpoint, info.Stream)
 
 	// For OpenAI streaming, inject stream_options so Ollama returns usage.
@@ -183,7 +194,11 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 		p.requestDuration.WithLabelValues(model, endpoint).Observe(time.Since(start).Seconds())
 	}()
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, p.ollamaURL.String()+endpoint, bytes.NewReader(body))
+	upstreamURL := *p.ollamaURL
+	upstreamURL.Path = strings.TrimRight(upstreamURL.Path, "/") + endpoint
+	upstreamURL.RawPath = ""
+	upstreamURL.RawQuery = r.URL.RawQuery
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "failed to create upstream request", http.StatusBadGateway)
 		return
@@ -414,6 +429,100 @@ func (p *proxy) recordAnthropicMetrics(reqModel, endpoint, respModel string, inp
 }
 
 // --- Helpers ---
+
+func isJSONContentType(r *http.Request) bool {
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		return true
+	}
+
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && (mediaType == "application/json" || strings.HasSuffix(mediaType, "+json"))
+}
+
+// repairEmptyAssistantMessages replaces only the invalid empty assistant turns
+// that Ollama rejects, leaving assistant tool-call messages untouched.
+func repairEmptyAssistantMessages(body []byte) ([]byte, int) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body, 0
+	}
+
+	rawMessages, ok := root["messages"]
+	if !ok {
+		return body, 0
+	}
+
+	var messages []json.RawMessage
+	if err := json.Unmarshal(rawMessages, &messages); err != nil || messages == nil {
+		return body, 0
+	}
+
+	changed := 0
+	for i, rawMessage := range messages {
+		var message map[string]json.RawMessage
+		if err := json.Unmarshal(rawMessage, &message); err != nil || message == nil {
+			continue
+		}
+
+		var role string
+		rawRole, ok := message["role"]
+		if !ok || json.Unmarshal(rawRole, &role) != nil || role != "assistant" {
+			continue
+		}
+
+		rawContent, ok := message["content"]
+		if !ok || !isJSONNull(rawContent) {
+			continue
+		}
+
+		if rawToolCalls, ok := message["tool_calls"]; ok && !isNullOrEmptyJSONArray(rawToolCalls) {
+			continue
+		}
+		if rawFunctionCall, ok := message["function_call"]; ok && !isJSONNull(rawFunctionCall) {
+			continue
+		}
+
+		message["content"] = json.RawMessage(`""`)
+		repairedMessage, err := json.Marshal(message)
+		if err != nil {
+			return body, 0
+		}
+		messages[i] = repairedMessage
+		changed++
+	}
+
+	if changed == 0 {
+		return body, 0
+	}
+
+	repairedMessages, err := json.Marshal(messages)
+	if err != nil {
+		return body, 0
+	}
+	root["messages"] = repairedMessages
+	repairedBody, err := json.Marshal(root)
+	if err != nil {
+		return body, 0
+	}
+	return repairedBody, changed
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func isNullOrEmptyJSONArray(raw json.RawMessage) bool {
+	if isJSONNull(raw) {
+		return true
+	}
+
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return false
+	}
+	return values != nil && len(values) == 0
+}
 
 // injectStreamUsage adds stream_options.include_usage to an OpenAI request
 // body so the server returns token counts in the final SSE chunk.
