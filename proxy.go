@@ -80,6 +80,9 @@ type proxy struct {
 	modelLoadDuration     *prometheus.CounterVec
 	tokensPerSecond       *prometheus.GaugeVec
 	activeRequests        *prometheus.GaugeVec
+
+	// dumpDir, when set and existing, receives /api/chat request/response dumps (see dump.go).
+	dumpDir string
 }
 
 const maxScanBuf = 1024 * 1024 // 1 MiB line buffer for streaming responses
@@ -166,6 +169,14 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 	var info requestInfo
 	json.Unmarshal(body, &info)
 
+	var dump *bodyDump
+	if endpoint == "/api/chat" {
+		dump = p.newBodyDump(endpoint, body)
+		if dump != nil {
+			defer dump.Close()
+		}
+	}
+
 	model := info.Model
 	if model == "" {
 		model = "unknown"
@@ -178,6 +189,17 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 		if repaired > 0 {
 			log.Printf("copilot_null_content_repaired path=%s count=%d", endpoint, repaired)
 		}
+	}
+
+	// Tool definitions are needed to recover GLM tool calls whose <tool_call>
+	// tag the model dropped (see glmtoolcall.go). Ollama accepts JSON bodies
+	// regardless of Content-Type, so do not gate this on the header.
+	var requestTools []requestToolDef
+	var loopKey string
+	var loopRepeats int
+	if r.Method == http.MethodPost && endpoint == "/api/chat" {
+		requestTools = parseRequestTools(body)
+		loopKey, loopRepeats = detectRepeatedToolCall(body)
 	}
 
 	streaming := resolveStreaming(endpoint, info.Stream)
@@ -217,12 +239,19 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(w, resp.Body)
+		if dump != nil {
+			io.Copy(io.MultiWriter(w, dump), resp.Body)
+		} else {
+			io.Copy(w, resp.Body)
+		}
 		return
 	}
 
 	flusher, canFlush := w.(http.Flusher)
 	ctx := streamContext{w: w, flusher: flusher, canFlush: canFlush}
+	if dump != nil {
+		ctx.tee = dump
+	}
 
 	switch endpoint {
 	case "/v1/chat/completions":
@@ -230,7 +259,7 @@ func (p *proxy) handleInference(w http.ResponseWriter, r *http.Request) {
 	case "/v1/messages":
 		p.handleAnthropic(ctx, resp.Body, streaming, model, endpoint)
 	default:
-		p.handleOllama(ctx, resp.Body, streaming, model, endpoint)
+		p.handleOllama(ctx, resp.Body, streaming, model, endpoint, requestTools, loopKey, loopRepeats)
 	}
 }
 
@@ -239,11 +268,19 @@ type streamContext struct {
 	w        http.ResponseWriter
 	flusher  http.Flusher
 	canFlush bool
+	tee      io.Writer // optional copy of everything written to the client
+}
+
+func (sc streamContext) write(b []byte) {
+	sc.w.Write(b)
+	if sc.tee != nil {
+		sc.tee.Write(b)
+	}
 }
 
 func (sc streamContext) writeLine(line string) {
-	sc.w.Write([]byte(line))
-	sc.w.Write([]byte("\n"))
+	sc.write([]byte(line))
+	sc.write([]byte("\n"))
 	if sc.canFlush {
 		sc.flusher.Flush()
 	}
@@ -277,13 +314,16 @@ func newScanner(r io.Reader) *bufio.Scanner {
 
 // --- Ollama native handler (/api/generate, /api/chat) ---
 
-func (p *proxy) handleOllama(ctx streamContext, body io.Reader, streaming bool, model, endpoint string) {
+func (p *proxy) handleOllama(ctx streamContext, body io.Reader, streaming bool, model, endpoint string, tools []requestToolDef, loopKey string, loopRepeats int) {
 	if !streaming {
 		respBody, err := io.ReadAll(body)
 		if err != nil {
 			return
 		}
-		ctx.w.Write(respBody)
+		if endpoint == "/api/chat" {
+			respBody = recoverGLMToolCallsInResponse(respBody, tools, endpoint, loopKey, loopRepeats)
+		}
+		ctx.write(respBody)
 		var stats ollamaStats
 		if json.Unmarshal(respBody, &stats) == nil {
 			p.recordOllamaMetrics(model, endpoint, &stats)
@@ -291,14 +331,29 @@ func (p *proxy) handleOllama(ctx streamContext, body io.Reader, streaming bool, 
 		return
 	}
 
+	var filter *glmStreamFilter
+	if endpoint == "/api/chat" {
+		filter = newGLMStreamFilter(tools, endpoint) // nil when the request has no tools
+		if filter != nil {
+			filter.setLoopGuard(loopKey, loopRepeats)
+		}
+	}
+
 	scanner := newScanner(body)
 	for scanner.Scan() {
-		line := scanner.Text()
-		ctx.writeLine(line)
+		line := scanner.Bytes()
 
 		var stats ollamaStats
-		if json.Unmarshal([]byte(line), &stats) == nil && stats.Done {
+		if json.Unmarshal(line, &stats) == nil && stats.Done {
 			p.recordOllamaMetrics(model, endpoint, &stats)
+		}
+
+		if filter == nil {
+			ctx.writeLine(string(line))
+			continue
+		}
+		for _, out := range filter.process(line) {
+			ctx.writeLine(string(out))
 		}
 	}
 }
