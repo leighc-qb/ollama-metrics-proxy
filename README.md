@@ -257,3 +257,54 @@ go test -run Repair -v ./...
   non-JSON content-type skip
 - [`nullcontent_regression_test.go`](nullcontent_regression_test.go) -- numeric
   precision, unrelated-field preservation, and byte-identical no-op behaviour
+
+## GLM tool-call recovery and loop breaker (fork addition)
+
+*Documents functionality that exists only in this fork.*
+
+GLM-4.x models served by Ollama (observed with GLM-4.5-Air under Ollama's
+`glm-4.7` renderer/parser) emit tool calls in shapes Ollama's parser does not
+recognise, so they reach the client as plain text or as `thinking`:
+
+- the opening `<tool_call>` tag is omitted right after `</think>`:
+  `read_file<arg_key>filePath</arg_key><arg_value>/x</arg_value></tool_call>`
+- the whole call is written inside the thinking block and the model stops
+  without ever emitting `</think>`
+- argument tags are malformed: missing `</arg_key>`, `<arg_value>` or `</arg_value>`
+
+GitHub Copilot Chat's Ollama provider only forwards `content` and `tool_calls`,
+so all of these show up as *"Sorry, no response was returned"*.
+
+On `/api/chat` responses to requests that carry `tools`, the proxy
+([`glmtoolcall.go`](glmtoolcall.go)):
+
+- withholds content that starts with a known tool name followed by `<arg_key>`
+  (or `</tool_call>` for parameterless tools) and re-emits it as `tool_calls`
+- extracts `<tool_call>...</tool_call>`, or a bare `name<arg_key>...`, from
+  thinking chunks and emits it as `tool_calls`; surrounding thinking is kept
+- parses argument tags tolerantly and coerces values by the tool's JSON-schema type
+- promotes a thinking-only answer to content, and emits
+  `[ollama-metrics-proxy] The model returned an empty response ...` for a
+  stream with nothing in it
+- **loop breaker**: when the request history already holds three consecutive
+  single tool calls with the same name and string arguments (paths compared by
+  last segment, numbers ignored) and the model emits it again, the call is
+  replaced by `[ollama-metrics-proxy] Stopped a tool-call loop: ...`
+
+Ordinary content is forwarded byte-identical. Native tool calls, thinking and
+the final stats chunk pass through. Non-streaming responses are repaired the
+same way. Only `/api/chat` is covered (what the Ollama VS Code extension uses),
+not `/v1/chat/completions`.
+
+Log lines: `glm_toolcall_recovered path=... tool=... from=content|thinking`,
+`glm_thinking_promoted_to_content`, `glm_empty_response_notice`,
+`glm_toolcall_loop_broken ... repeats=N`.
+
+## Debug body dumps (fork addition)
+
+While the directory given by `--dump-dir` (default
+`~/.cache/ollama-metrics-proxy/dump`) **exists**, every `/api/chat` request body
+and the full response as sent to the client are written to
+`<timestamp>-<seq>.req.json` / `.resp.ndjson` (mode 0600). Create or remove the
+directory to toggle dumping; no restart needed. Dumps contain prompts and model
+output.
